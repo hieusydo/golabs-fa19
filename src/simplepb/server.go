@@ -7,6 +7,7 @@ package simplepb
 //
 
 import (
+	"fmt"
 	"sync"
 
 	"labrpc"
@@ -156,6 +157,10 @@ func Make(peers []*labrpc.ClientEnd, me int, startingView int) *PBServer {
 // *if it's eventually committed*. The second return value is the current
 // view. The third return value is true if this server believes it is
 // the primary.
+//
+// When Start(command) is invoked, the primary should append the command in its log
+// and then send Prepare RPCs to other servers to instruct them to replicate the command in the same index in their log.
+// Note that a server should do the processing for Start only if it believes itself to be the current primary and that its status is NORMAL (as opposed to VIEW-CHANGE or RECOVERY).
 func (srv *PBServer) Start(command interface{}) (
 	index int, view int, ok bool) {
 	srv.mu.Lock()
@@ -168,8 +173,57 @@ func (srv *PBServer) Start(command interface{}) (
 		return -1, srv.currentView, false
 	}
 
-	// Your code here
+	fmt.Printf("Server{%d} View{%d} Replicating command=%d\n", srv.me, srv.currentView, command)
 
+	view = srv.currentView
+	index = len(srv.log)
+	srv.log = append(srv.log, command)
+
+	// send StartView to all servers including myself
+	prepareChan := make(chan *PrepareReply, len(srv.peers))
+	for i := 0; i < len(srv.peers); i++ {
+		if i != srv.me {
+			go func(server int) {
+				prepArgs := &PrepareArgs{
+					View:          view,            // the primary's current view
+					PrimaryCommit: srv.commitIndex, // the primary's commitIndex
+					Index:         index,           // the index position at which the log entry is to be replicated on backups
+					Entry:         command,         // the log entry to be replicated
+				}
+				var prepReply PrepareReply
+				ok := srv.sendPrepare(server, prepArgs, &prepReply)
+				if ok {
+					prepareChan <- &prepReply
+				} else {
+					prepareChan <- nil
+				}
+			}(i)
+		}
+	}
+
+	// Consider the index "committed" once received Success=true responses from a majority of servers (including itself)
+	go func() {
+		// fmt.Printf("Server{%d} Checking\n", srv.me)
+		var successReplies []*PrepareReply
+		var nReplies int
+		majority := len(srv.peers) / 2
+		for r := range prepareChan {
+			nReplies++
+			if r != nil && r.Success {
+				successReplies = append(successReplies, r)
+			}
+			if nReplies == len(srv.peers) || len(successReplies) == majority {
+				if index > srv.commitIndex {
+					srv.commitIndex = index
+					fmt.Printf("Server{%d} committed %d\n", srv.me, srv.commitIndex)
+					break
+				}
+			}
+		}
+		// fmt.Printf("Server{%d} Done checking\n", srv.me)
+	}()
+
+	ok = true
 	return index, view, ok
 }
 
@@ -194,13 +248,78 @@ func (srv *PBServer) sendPrepare(server int, args *PrepareArgs, reply *PrepareRe
 }
 
 // Prepare is the RPC handler for the Prepare RPC
+// Upon receiving a Prepare RPC message, the backup checks whether the message's view and its currentView match
+// and whether the next entry to be added to the log is indeed at the index specified in the message.
+// If so, the backup adds the message's entry to the log and replies Success=ok.
+// Otherwise, the backup replies Success=false.
+// Furthermore, if the backup's state falls behind the primary (e.g. its view is smaller or its log is missing entries),
+// it performs recovery to transfer the primary's log.
+// Note that the backup server needs to process Prepare messages according to their index order, otherwise, it would end up unnecessarily rejecting many messages.
 func (srv *PBServer) Prepare(args *PrepareArgs, reply *PrepareReply) {
-	// Your code here
+	srv.mu.Lock()
+	defer srv.mu.Unlock()
+
+	if srv.currentView > args.View {
+		// Simply reject requests from outdated (primary) server
+		reply.Success = false
+		return
+	}
+
+	if srv.currentView < args.View {
+		// View change recovervy
+		recoveryArgs := &RecoveryArgs{
+			View:   srv.currentView,
+			Server: srv.me,
+		}
+		var recoveryReply RecoveryReply
+		primary := GetPrimary(args.View, len(srv.peers))
+		ok := srv.peers[primary].Call("PBServer.Recovery", recoveryArgs, &recoveryReply)
+		if !ok {
+			reply.Success = false
+			return
+		}
+		srv.currentView = recoveryReply.View
+		srv.log = recoveryReply.Entries
+		srv.commitIndex = args.PrimaryCommit
+		srv.lastNormalView = recoveryArgs.View
+		fmt.Printf("Recovered currentView=%d, commitIdx=%d, log=%d, stat=%v\n", srv.currentView, srv.commitIndex, srv.log, srv.status)
+		return
+	}
+
+	if args.Index < len(srv.log) {
+		reply.Success = true
+		return
+	}
+	if args.Index > len(srv.log) {
+		recoveryArgs := &RecoveryArgs{
+			View:   srv.currentView,
+			Server: srv.me,
+		}
+		var recoveryReply RecoveryReply
+		primary := GetPrimary(srv.currentView, len(srv.peers))
+		ok := srv.peers[primary].Call("PBServer.Recovery", recoveryArgs, &recoveryReply)
+		if !ok {
+			reply.Success = false
+			return
+		}
+		srv.currentView = recoveryReply.View
+		for missedIdx := len(srv.log); missedIdx < len(recoveryReply.Entries) && missedIdx < args.Index; missedIdx++ {
+			srv.log = append(srv.log, recoveryReply.Entries[missedIdx])
+		}
+	}
+	srv.log = append(srv.log, args.Entry)
+	srv.commitIndex = args.PrimaryCommit
+	reply.Success = true
+	fmt.Printf("Server{%d} commitIdx=%d. Processed %d at pos=%d. Curr log=%d\n", srv.me, srv.commitIndex, args.Entry, args.Index, srv.log)
 }
 
 // Recovery is the RPC handler for the Recovery RPC
 func (srv *PBServer) Recovery(args *RecoveryArgs, reply *RecoveryReply) {
-	// Your code here
+	// Handled by Primary
+	reply.Entries = srv.log
+	reply.PrimaryCommit = srv.commitIndex
+	reply.View = srv.currentView
+	reply.Success = true
 }
 
 // Some external oracle prompts the primary of the newView to
@@ -275,16 +394,71 @@ func (srv *PBServer) PromptViewChange(newView int) {
 // otherwise, ok = false.
 func (srv *PBServer) determineNewViewLog(successReplies []*ViewChangeReply) (
 	ok bool, newViewLog []interface{}) {
-	// Your code here
+	// chooses the log among the majority of successful replies using this rule:
+	// it picks the log whose lastest normal view number is the largest.
+	// If there are more than one such logs, it picks the longest log among those.
+	majority := len(srv.peers)/2 + 1
+	if len(successReplies) < majority {
+		return false, newViewLog
+	}
+
+	lastNormalView := 0
+	for i := 0; i < len(successReplies); i++ {
+		var reply = successReplies[i]
+		if reply.LastNormalView > lastNormalView {
+			newViewLog = reply.Log
+			lastNormalView = reply.LastNormalView
+		} else if reply.LastNormalView == lastNormalView && len(reply.Log) > len(newViewLog) {
+			newViewLog = reply.Log
+		}
+	}
+	ok = true
+
 	return ok, newViewLog
 }
 
 // ViewChange is the RPC handler to process ViewChange RPC.
 func (srv *PBServer) ViewChange(args *ViewChangeArgs, reply *ViewChangeReply) {
-	// Your code here
+	// Upon receving ViewChange, a replica server checks that the view number included in the message is
+	// indeed larger than what it thinks the current view number is.
+	// If the check succeeds, it sets its current view number to that in the message and modifies its status to VIEW-CHANGE.
+	// It replies Success=true and includes its current log (in its entirety) as well as the latest view-number that has been considered NORMAL. If the check fails, the backup replies Success=false.
+
+	srv.mu.Lock()
+	defer srv.mu.Unlock()
+
+	fmt.Printf("Server{%d} current view=%d, lastNormalView=%d - ViewChange to %d, log=%d\n", srv.me, srv.currentView, srv.lastNormalView, args.View, srv.log)
+
+	if args.View <= srv.currentView {
+		reply.Success = false
+		return
+	}
+
+	srv.currentView = args.View
+	srv.status = VIEWCHANGE
+
+	reply.Success = true
+	reply.LastNormalView = srv.lastNormalView
+	reply.Log = srv.log
 }
 
 // StartView is the RPC handler to process StartView RPC.
 func (srv *PBServer) StartView(args *StartViewArgs, reply *StartViewReply) {
-	// Your code here
+	// Upon receive StartView, a server sets the new-view as indicated in the message and changes its status to be NORMAL.
+	// Note that before setting the new-view according to the StartView RPC message, the server must again check that its current view is
+	// no bigger than that in the RPC message, which would mean that there's been no concurrent view-change for a larger view.
+
+	srv.mu.Lock()
+	defer srv.mu.Unlock()
+
+	if args.View < srv.currentView {
+		return
+	}
+
+	srv.currentView = args.View
+	srv.log = args.Log
+	srv.status = NORMAL
+	srv.lastNormalView = srv.currentView
+	srv.commitIndex = len(srv.log) - 1
+	fmt.Printf("Server{%d} current view=%d, lastNormalView=%d - StartView %d, log=%d, commitIdx=%d, me=%d\n", srv.me, srv.currentView, srv.lastNormalView, args.View, srv.log, srv.commitIndex, srv.me)
 }

@@ -8,15 +8,18 @@ package simplepb
 // test with the original before submitting.
 //
 
-import "labrpc"
-import "sync"
-import "testing"
-import "runtime"
-import crand "crypto/rand"
-import "encoding/base64"
-import "sync/atomic"
-import "time"
-import "fmt"
+import (
+	"labrpc"
+	"runtime"
+	"sync"
+	"testing"
+
+	crand "crypto/rand"
+	"encoding/base64"
+	"fmt"
+	"sync/atomic"
+	"time"
+)
 
 func randstring(n int) string {
 	b := make([]byte, 2*n)
@@ -90,7 +93,6 @@ func (cfg *config) crash1(i int) {
 	}
 }
 
-//
 // make and initialize a server.
 func (cfg *config) start1(i int) {
 	cfg.crash1(i)

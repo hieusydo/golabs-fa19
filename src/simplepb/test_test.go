@@ -209,6 +209,7 @@ func Test1BSimpleViewChange(t *testing.T) {
 	}
 
 	// reconnect old primary
+	// fmt.Println("RE-CONNECTING OLD PRIMARY")
 	cfg.connect(oldPrimary)
 
 	// replicate 5005 through newPrimary to all 3 servers
